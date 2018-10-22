@@ -28,30 +28,28 @@
 #if defined(MtProtoKitDynamicFramework)
 #   import <MTProtoKitDynamic/MTDisposable.h>
 #   import <MTProtoKitDynamic/MTSignal.h>
+#   import <MTProtoKitDynamic/MTAtomic.h>
 #elif defined(MtProtoKitMacFramework)
 #   import <MTProtoKitMac/MTDisposable.h>
 #   import <MTProtoKitMac/MTSignal.h>
+#   import <MTProtoKitMac/MTAtomic.h>
 #else
 #   import <MTProtoKit/MTDisposable.h>
 #   import <MTProtoKit/MTSignal.h>
+#   import <MTProtoKit/MTAtomic.h>
 #endif
 
 #import <netinet/in.h>
 #import <arpa/inet.h>
 
-typedef struct {
-    uint8_t nonce[16];
-} MTPayloadData;
-
 @implementation MTDiscoverConnectionSignals
 
-+ (NSData *)payloadData:(MTPayloadData *)outPayloadData;
-{
++ (NSData *)payloadData:(MTPayloadData *)outPayloadData context:(MTContext *)context address:(MTDatacenterAddress *)address {
     uint8_t reqPqBytes[] = {
         0, 0, 0, 0, 0, 0, 0, 0, // zero * 8
         0, 0, 0, 0, 0, 0, 0, 0, // message id
         20, 0, 0, 0, // message length
-        0x78, 0x97, 0x46, 0x60, // req_pq
+        0xf1, 0x8e, 0x7e, 0xbe, // req_pq_multi
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 // nonce
     };
     
@@ -60,21 +58,43 @@ typedef struct {
     if (outPayloadData)
         *outPayloadData = payloadData;
     
-    arc4random_buf(reqPqBytes + 8, 8);
+    int64_t messageId = (int64_t)([[NSDate date] timeIntervalSince1970] * 4294967296);
+    memcpy(reqPqBytes + 8, &messageId, 8);
+    
     memcpy(reqPqBytes + 8 + 8 + 4 + 4, payloadData.nonce, 16);
     
-    return [[NSData alloc] initWithBytes:reqPqBytes length:sizeof(reqPqBytes)];
+    NSMutableData *data = [[NSMutableData alloc] initWithBytes:reqPqBytes length:sizeof(reqPqBytes)];
+    
+    NSData *secret = address.secret;
+    if (context.apiEnvironment.socksProxySettings != nil) {
+        if (context.apiEnvironment.socksProxySettings.secret != nil) {
+            secret = context.apiEnvironment.socksProxySettings.secret;
+        }
+    }
+    
+    bool extendedPadding = false;
+    if (secret != nil) {
+        if ([MTSocksProxySettings secretSupportsExtendedPadding:secret]) {
+            extendedPadding = true;
+        }
+    }
+    
+    if (extendedPadding) {
+        uint32_t paddingSize = arc4random_uniform(128);
+        if (paddingSize != 0) {
+            uint8_t padding[128];
+            arc4random_buf(padding, paddingSize);
+            [data appendBytes:padding length:paddingSize];
+        }
+    }
+    return data;
 }
 
-+ (bool)isResponseValid:(NSData *)data payloadData:(MTPayloadData)payloadData
-{
-    if (data.length == 84)
-    {
++ (bool)isResponseValid:(NSData *)data payloadData:(MTPayloadData)payloadData {
+    if (data.length >= 84) {
         uint8_t zero[] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-        uint8_t length[] = { 0x40, 0, 0, 0 };
         uint8_t resPq[] = { 0x63, 0x24, 0x16, 0x05 };
-        if (memcmp((uint8_t * const)data.bytes, zero, 8) == 0 && memcmp(((uint8_t * const)data.bytes) + 16, length, 4) == 0 && memcmp(((uint8_t * const)data.bytes) + 20, resPq, 4) == 0 && memcmp(((uint8_t * const)data.bytes) + 24, payloadData.nonce, 16) == 0)
-        {
+        if (memcmp((uint8_t * const)data.bytes, zero, 8) == 0 && memcmp(((uint8_t * const)data.bytes) + 20, resPq, 4) == 0 && memcmp(((uint8_t * const)data.bytes) + 24, payloadData.nonce, 16) == 0) {
             return true;
         }
     }
@@ -95,10 +115,10 @@ typedef struct {
 
 + (MTSignal *)tcpConnectionWithContext:(MTContext *)context datacenterId:(NSUInteger)datacenterId address:(MTDatacenterAddress *)address;
 {
-    return [[MTSignal alloc] initWithGenerator:^id<MTDisposable>(MTSubscriber *subscriber)
+    return [[[MTSignal alloc] initWithGenerator:^id<MTDisposable>(MTSubscriber *subscriber)
     {
         MTPayloadData payloadData;
-        NSData *data = [self payloadData:&payloadData];
+        NSData *data = [self payloadData:&payloadData context:context address:address];
         
         MTTcpConnection *connection = [[MTTcpConnection alloc] initWithContext:context datacenterId:datacenterId address:address interface:nil usageCalculationInfo:nil];
         __weak MTTcpConnection *weakConnection = connection;
@@ -108,10 +128,10 @@ typedef struct {
             if (strongConnection != nil)
                 [strongConnection sendDatas:@[data] completion:nil requestQuickAck:false expectDataInResponse:true];
         };
-        __block bool received = false;
+        MTAtomic *processedData = [[MTAtomic alloc] initWithValue:@false];
         connection.connectionReceivedData = ^(NSData *data)
         {
-            received = true;
+            [processedData swap:@true];
             if ([self isResponseValid:data payloadData:payloadData])
             {
                 if (MTLogEnabled()) {
@@ -122,19 +142,24 @@ typedef struct {
             else
             {
                 if (MTLogEnabled()) {
-                    MTLog(@"failed tcp://%@:%d", address.ip, (int)address.port);
+                    MTLog(@"failed tcp://%@:%d (invalid response)", address.ip, (int)address.port);
                 }
                 [subscriber putError:nil];
             }
         };
         connection.connectionClosed = ^
         {
+            __block bool received = false;
+            [processedData with:^id (NSNumber *value) {
+                received = [value boolValue];
+                return nil;
+            }];
             if (!received) {
                 if (MTLogEnabled()) {
-                    MTLog(@"failed tcp://%@:%d", address.ip, (int)address.port);
+                    MTLog(@"failed tcp://%@:%d (disconnected)", address.ip, (int)address.port);
                 }
+                [subscriber putError:nil];
             }
-            [subscriber putError:nil];
         };
         if (MTLogEnabled()) {
             MTLog(@"trying tcp://%@:%d", address.ip, (int)address.port);
@@ -145,15 +170,15 @@ typedef struct {
         {
             [connection stop];
         }];
-    }];
+    }] startOn:[MTTcpConnection tcpQueue]];
 }
 
-+ (MTSignal *)httpConnectionWithAddress:(MTDatacenterAddress *)address
++ (MTSignal *)httpConnectionWithAddress:(MTDatacenterAddress *)address context:(MTContext *)context
 {
     return [[MTSignal alloc] initWithGenerator:^id<MTDisposable>(MTSubscriber *subscriber)
     {
         MTPayloadData payloadData;
-        NSData *data = [self payloadData:&payloadData];
+        NSData *data = [self payloadData:&payloadData context:context address:address];
         
         MTHttpWorkerBlockDelegate *delegate = [[MTHttpWorkerBlockDelegate alloc] init];
         
@@ -182,7 +207,7 @@ typedef struct {
     }];
 }
 
-+ (MTSignal *)discoverSchemeWithContext:(MTContext *)context addressList:(NSArray *)addressList media:(bool)media isProxy:(bool)isProxy
++ (MTSignal *)discoverSchemeWithContext:(MTContext *)context datacenterId:(NSInteger)datacenterId addressList:(NSArray *)addressList media:(bool)media isProxy:(bool)isProxy
 {
     NSMutableArray *bestAddressList = [[NSMutableArray alloc] init];
     
@@ -213,11 +238,11 @@ typedef struct {
     
     for (MTDatacenterAddress *address in bestAddressList) {
         MTTransportScheme *tcpTransportScheme = [[MTTransportScheme alloc] initWithTransportClass:[MTTcpTransport class] address:address media:media];
-        MTTransportScheme *httpTransportScheme = [[MTTransportScheme alloc] initWithTransportClass:[MTHttpTransport class] address:address media:media];
+        //MTTransportScheme *httpTransportScheme = [[MTTransportScheme alloc] initWithTransportClass:[MTHttpTransport class] address:address media:media];
         
         if ([self isIpv6:address.ip])
         {
-            MTSignal *signal = [[[[self tcpConnectionWithContext:context datacenterId:0 address:address] then:[MTSignal single:tcpTransportScheme]] timeout:5.0 onQueue:[MTQueue concurrentDefaultQueue] orSignal:[MTSignal fail:nil]] catch:^MTSignal *(__unused id error)
+            MTSignal *signal = [[[[self tcpConnectionWithContext:context datacenterId:datacenterId address:address] then:[MTSignal single:tcpTransportScheme]] timeout:5.0 onQueue:[MTQueue concurrentDefaultQueue] orSignal:[MTSignal fail:nil]] catch:^MTSignal *(__unused id error)
             {
                 return [MTSignal complete];
             }];
@@ -225,7 +250,7 @@ typedef struct {
         }
         else
         {
-            MTSignal *tcpConnectionWithTimeout = [[[self tcpConnectionWithContext:context datacenterId:0 address:address] then:[MTSignal single:tcpTransportScheme]] timeout:5.0 onQueue:[MTQueue concurrentDefaultQueue] orSignal:[MTSignal fail:nil]];
+            MTSignal *tcpConnectionWithTimeout = [[[self tcpConnectionWithContext:context datacenterId:datacenterId address:address] then:[MTSignal single:tcpTransportScheme]] timeout:5.0 onQueue:[MTQueue concurrentDefaultQueue] orSignal:[MTSignal fail:nil]];
             MTSignal *signal = [tcpConnectionWithTimeout catch:^MTSignal *(__unused id error)
             {
                 return [MTSignal complete];
@@ -236,9 +261,9 @@ typedef struct {
             for (NSNumber *nPort in alternatePorts) {
                 NSSet *ipsWithPort = tcpIpsByPort[nPort];
                 if (![ipsWithPort containsObject:address.ip]) {
-                    MTDatacenterAddress *portAddress = [[MTDatacenterAddress alloc] initWithIp:address.ip port:[nPort intValue] preferForMedia:address.preferForMedia restrictToTcp:address.restrictToTcp cdn:address.cdn preferForProxy:address.preferForProxy];
+                    MTDatacenterAddress *portAddress = [[MTDatacenterAddress alloc] initWithIp:address.ip port:[nPort intValue] preferForMedia:address.preferForMedia restrictToTcp:address.restrictToTcp cdn:address.cdn preferForProxy:address.preferForProxy secret:address.secret];
                     MTTransportScheme *tcpPortTransportScheme = [[MTTransportScheme alloc] initWithTransportClass:[MTTcpTransport class] address:portAddress media:media];
-                    MTSignal *tcpConnectionWithTimeout = [[[self tcpConnectionWithContext:context datacenterId:0 address:portAddress] then:[MTSignal single:tcpPortTransportScheme]] timeout:5.0 onQueue:[MTQueue concurrentDefaultQueue] orSignal:[MTSignal fail:nil]];
+                    MTSignal *tcpConnectionWithTimeout = [[[self tcpConnectionWithContext:context datacenterId:datacenterId address:portAddress] then:[MTSignal single:tcpPortTransportScheme]] timeout:5.0 onQueue:[MTQueue concurrentDefaultQueue] orSignal:[MTSignal fail:nil]];
                     MTSignal *signal = [tcpConnectionWithTimeout catch:^MTSignal *(__unused id error) {
                         return [MTSignal complete];
                     }];
@@ -247,7 +272,7 @@ typedef struct {
             }
         }
         
-        if (!address.restrictToTcp && !isProxy) {
+        /*if (!address.restrictToTcp && !isProxy) {
             MTSignal *signal = [[[[self httpConnectionWithAddress:address] then:[MTSignal single:httpTransportScheme]] timeout:5.0 onQueue:[MTQueue concurrentDefaultQueue] orSignal:[MTSignal fail:nil]] catch:^MTSignal *(__unused id error)
             {
                 return [MTSignal complete];
@@ -263,7 +288,7 @@ typedef struct {
                     return [MTSignal complete];
                 }]];
             }
-        }
+        }*/
     }
     
     MTSignal *repeatDelaySignal = [[MTSignal complete] delay:1.0 onQueue:[MTQueue concurrentDefaultQueue]];
@@ -289,7 +314,9 @@ typedef struct {
             return [MTSignal single:scheme];
     }];
     
-    return signal;
+    return [signal catch:^MTSignal *(id error) {
+        return [MTSignal complete];
+    }];
 }
 
 @end
